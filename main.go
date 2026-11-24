@@ -38,13 +38,13 @@ func main() {
 
 	log.Info("正在启动 Chrelyonly Mail Server 🍓...")
 
-	// 3. 初始化数据库连接
-	db, err := database.InitDB(cfg.Database)
+	// 3. 初始化数据库连接（支持失败自动重试）
+	db, err := database.InitDB(cfg.Database, log)
 	if err != nil {
-		log.Fatal("初始化数据库连接失败", zap.Error(err))
+		log.Fatal("建立数据库连接失败", zap.Error(err))
 	}
 	defer db.Close()
-	log.Info("数据库连接成功", zap.String("driver", cfg.Database.Driver))
+	log.Info("数据库连接就绪", zap.String("driver", cfg.Database.Driver))
 
 	// 4. 初始化文件存储
 	storageMgr, err := storage.NewStorageManager(cfg.Storage)
