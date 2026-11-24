@@ -232,6 +232,10 @@ func (r *Repository) GetMessageByMessageID(messageID string) (*model.Message, er
 }
 
 func (r *Repository) ListMessages(accountEmail string, page int, size int) ([]model.Message, int64, error) {
+	return r.ListFolderMessages(accountEmail, "ALL", page, size)
+}
+
+func (r *Repository) ListFolderMessages(accountEmail string, folder string, page int, size int) ([]model.Message, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -252,17 +256,47 @@ func (r *Repository) ListMessages(accountEmail string, page int, size int) ([]mo
 		if acc == nil {
 			return []model.Message{}, 0, nil
 		}
-		countQuery = `SELECT COUNT(*) FROM mail_messages WHERE account_id = ?`
-		listQuery = `SELECT id, message_id, account_id, from_address, subject, text_content, html_content, raw_file_path, size_bytes, has_attachments, is_read, direction, status, received_at, created_at, updated_at FROM mail_messages WHERE account_id = ? ORDER BY id DESC LIMIT ? OFFSET ?`
-		args = append(args, acc.ID)
+		cleanEmail := strings.ToLower(strings.TrimSpace(accountEmail))
+
+		if strings.EqualFold(folder, "INBOX") {
+			countQuery = `SELECT COUNT(DISTINCT m.id) FROM mail_messages m
+				LEFT JOIN mail_recipients r ON m.id = r.message_id
+				WHERE r.email_address = ? OR (m.account_id = ? AND m.direction = 'inbound')`
+			listQuery = `SELECT DISTINCT m.id, m.message_id, m.account_id, m.from_address, m.subject, m.text_content, m.html_content, m.raw_file_path, m.size_bytes, m.has_attachments, m.is_read, m.direction, m.status, m.received_at, m.created_at, m.updated_at
+				FROM mail_messages m
+				LEFT JOIN mail_recipients r ON m.id = r.message_id
+				WHERE r.email_address = ? OR (m.account_id = ? AND m.direction = 'inbound')
+				ORDER BY m.id DESC LIMIT ? OFFSET ?`
+			args = append(args, cleanEmail, acc.ID)
+		} else if strings.EqualFold(folder, "SENT") {
+			countQuery = `SELECT COUNT(DISTINCT m.id) FROM mail_messages m
+				LEFT JOIN mail_recipients r ON m.id = r.message_id
+				WHERE m.from_address = ? OR (m.account_id = ? AND m.direction = 'outbound')`
+			listQuery = `SELECT DISTINCT m.id, m.message_id, m.account_id, m.from_address, m.subject, m.text_content, m.html_content, m.raw_file_path, m.size_bytes, m.has_attachments, m.is_read, m.direction, m.status, m.received_at, m.created_at, m.updated_at
+				FROM mail_messages m
+				LEFT JOIN mail_recipients r ON m.id = r.message_id
+				WHERE m.from_address = ? OR (m.account_id = ? AND m.direction = 'outbound')
+				ORDER BY m.id DESC LIMIT ? OFFSET ?`
+			args = append(args, cleanEmail, acc.ID)
+		} else {
+			countQuery = `SELECT COUNT(DISTINCT m.id) FROM mail_messages m
+				LEFT JOIN mail_recipients r ON m.id = r.message_id
+				WHERE r.email_address = ? OR m.from_address = ? OR m.account_id = ?`
+			listQuery = `SELECT DISTINCT m.id, m.message_id, m.account_id, m.from_address, m.subject, m.text_content, m.html_content, m.raw_file_path, m.size_bytes, m.has_attachments, m.is_read, m.direction, m.status, m.received_at, m.created_at, m.updated_at
+				FROM mail_messages m
+				LEFT JOIN mail_recipients r ON m.id = r.message_id
+				WHERE r.email_address = ? OR m.from_address = ? OR m.account_id = ?
+				ORDER BY m.id DESC LIMIT ? OFFSET ?`
+			args = append(args, cleanEmail, cleanEmail, acc.ID)
+		}
 	} else {
 		countQuery = `SELECT COUNT(*) FROM mail_messages`
 		listQuery = `SELECT id, message_id, account_id, from_address, subject, text_content, html_content, raw_file_path, size_bytes, has_attachments, is_read, direction, status, received_at, created_at, updated_at FROM mail_messages ORDER BY id DESC LIMIT ? OFFSET ?`
 	}
 
 	var total int64
-	if accountEmail != "" {
-		_ = r.db.QueryRow(countQuery, args[0]).Scan(&total)
+	if len(args) > 0 {
+		_ = r.db.QueryRow(countQuery, args...).Scan(&total)
 	} else {
 		_ = r.db.QueryRow(countQuery).Scan(&total)
 	}

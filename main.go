@@ -12,6 +12,7 @@ import (
 	"chrelyonly-email-server-go/internal/config"
 	"chrelyonly-email-server-go/internal/database"
 	"chrelyonly-email-server-go/internal/delivery"
+	"chrelyonly-email-server-go/internal/imap"
 	"chrelyonly-email-server-go/internal/logger"
 	"chrelyonly-email-server-go/internal/queue"
 	"chrelyonly-email-server-go/internal/repository"
@@ -74,7 +75,14 @@ func main() {
 	}
 	defer smtpManager.Stop()
 
-	// 9. 启动内部 HTTP API 服务
+	// 9. 启动 IMAP 收件服务端 (支持 143 端口)
+	imapManager := imap.NewIMAPServerManager(cfg.IMAP, repo, storageMgr, dispatcher, log)
+	if err := imapManager.Start(); err != nil {
+		log.Error("启动 IMAP 服务端失败", zap.Error(err))
+	}
+	defer imapManager.Stop()
+
+	// 10. 启动内部 HTTP API 服务
 	apiHandler := api.NewAPIHandler(repo, storageMgr, dispatcher, db, log)
 	router := api.SetupRouter(apiHandler)
 
@@ -92,7 +100,7 @@ func main() {
 		}
 	}()
 
-	// 10. 优雅退出处理
+	// 11. 优雅退出处理
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit

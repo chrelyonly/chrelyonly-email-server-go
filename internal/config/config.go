@@ -11,6 +11,7 @@ import (
 type Config struct {
 	Server   ServerConfig   `yaml:"server"`
 	SMTP     SMTPConfig     `yaml:"smtp"`
+	IMAP     IMAPConfig     `yaml:"imap"`
 	Database DatabaseConfig `yaml:"database"`
 	Storage  StorageConfig  `yaml:"storage"`
 	Webhook  WebhookConfig  `yaml:"webhook"`
@@ -39,6 +40,11 @@ type SMTPConfig struct {
 	Hostname string    `yaml:"hostname"`
 	Ports    SMTPPorts `yaml:"ports"`
 	TLS      TLSConfig `yaml:"tls"`
+}
+
+type IMAPConfig struct {
+	Enabled bool `yaml:"enabled"`
+	Port    int  `yaml:"port"`
 }
 
 type DatabaseConfig struct {
@@ -94,6 +100,9 @@ func LoadConfig(path string) (*Config, error) {
 	// 补全默认值
 	if cfg.Server.HTTPAddr == "" {
 		cfg.Server.HTTPAddr = "127.0.0.1:18080"
+	}
+	if cfg.IMAP.Port == 0 {
+		cfg.IMAP.Port = 143
 	}
 	if cfg.Storage.MessagePath == "" {
 		cfg.Storage.MessagePath = "./data/messages"

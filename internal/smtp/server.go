@@ -2,9 +2,14 @@ package smtp
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"time"
 
@@ -50,6 +55,52 @@ func NewSMTPServerManager(
 	}
 }
 
+// 自动生成包含本机局域网 IP SAN 签名的内存 TLS 证书
+func generateSelfSignedCert() (*tls.Certificate, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+
+	var ips []net.IP
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				if ipnet.IP.To4() != nil {
+					ips = append(ips, ipnet.IP)
+				}
+			}
+		}
+	}
+	ips = append(ips, net.ParseIP("127.0.0.1"), net.ParseIP("192.168.10.70"))
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Chrelyonly Mail"},
+		},
+		NotBefore: time.Now().Add(-1 * time.Hour),
+		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
+
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"mail.chrelyonly.cn", "localhost"},
+		IPAddresses:           ips,
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return nil, err
+	}
+
+	cert := tls.Certificate{
+		Certificate: [][]byte{derBytes},
+		PrivateKey:  priv,
+	}
+	return &cert, nil
+}
+
 // Start 启动 SMTP 监听服务 (端口 25, 465, 587)
 func (m *SMTPServerManager) Start() error {
 	backend := &Backend{
@@ -63,7 +114,15 @@ func (m *SMTPServerManager) Start() error {
 			tlsCert = &cert
 			m.logger.Info("TLS 证书已加载", zap.String("cert", m.cfg.TLS.CertFile))
 		} else {
-			m.logger.Warn("加载 TLS 证书失败", zap.Error(err))
+			m.logger.Warn("加载指定 TLS 证书失败，降级使用自签名证书", zap.Error(err))
+		}
+	}
+
+	if tlsCert == nil {
+		cert, err := generateSelfSignedCert()
+		if err == nil {
+			tlsCert = cert
+			m.logger.Info("已自动启用默认自签名 TLS/STARTTLS 加密支持")
 		}
 	}
 
@@ -146,6 +205,8 @@ func (b *Backend) NewSession(c *gosmtp.Conn) (gosmtp.Session, error) {
 		remoteIP = host
 	}
 
+	b.manager.logger.Info("收到客户端建立的 SMTP 端口连接", zap.String("remoteIP", remoteIP))
+
 	return &Session{
 		manager:  b.manager,
 		remoteIP: remoteIP,
@@ -164,22 +225,26 @@ type Session struct {
 }
 
 func (s *Session) AuthMechanisms() []string {
+	s.manager.logger.Info("SMTP 客户端查询认证机制 AuthMechanisms", zap.String("remoteIP", s.remoteIP))
 	return []string{sasl.Plain, sasl.Login}
 }
 
 func (s *Session) authenticate(username, password string) error {
 	acc, err := s.manager.repo.GetAccountByEmail(username)
 	if err != nil || acc == nil {
+		s.manager.logger.Warn("SMTP 认证失败：账号不存在", zap.String("username", username))
 		s.recordAuthLog(username, false, "Account not found")
 		return gosmtp.ErrAuthFailed
 	}
 
 	if !acc.IsActive {
+		s.manager.logger.Warn("SMTP 认证失败：账号已被禁用", zap.String("username", username))
 		s.recordAuthLog(username, false, "Account disabled")
 		return gosmtp.ErrAuthFailed
 	}
 
 	if !security.VerifyPassword(password, acc.PasswordHash) {
+		s.manager.logger.Warn("SMTP 认证失败：密码校验不匹配", zap.String("username", username))
 		s.recordAuthLog(username, false, "Invalid password")
 		return gosmtp.ErrAuthFailed
 	}
@@ -187,6 +252,7 @@ func (s *Session) authenticate(username, password string) error {
 	s.authenticated = true
 	s.authenticatedUser = acc.Email
 	s.recordAuthLog(username, true, "Success")
+	s.manager.logger.Info("SMTP 账户登录校验成功", zap.String("username", username))
 	return nil
 }
 
@@ -225,37 +291,54 @@ func (s *loginServer) Next(response []byte) (challenge []byte, done bool, err er
 }
 
 func (s *Session) Auth(mech string, saslServer sasl.Server) error {
-	var server sasl.Server
+	s.manager.logger.Info("收到 SMTP 客户端 AUTH 请求", zap.String("mech", mech), zap.String("remoteIP", s.remoteIP))
 
 	switch mech {
 	case sasl.Plain:
-		server = sasl.NewPlainServer(func(identity, username, password string) error {
+		// 1. 读取 go-smtp 接收到的客户端 PLAIN 密文数据
+		clientBytes, _, err := saslServer.Next(nil)
+		if err != nil && len(clientBytes) == 0 {
+			s.manager.logger.Warn("SMTP AUTH PLAIN 读取客户端数据失败", zap.Error(err))
+			return gosmtp.ErrAuthFailed
+		}
+
+		// 2. 校验账号密码
+		plainServer := sasl.NewPlainServer(func(identity, username, password string) error {
 			return s.authenticate(username, password)
 		})
+
+		_, _, authErr := plainServer.Next(clientBytes)
+		if authErr != nil {
+			s.manager.logger.Warn("SMTP AUTH PLAIN 密码认证失败", zap.Error(authErr))
+			return gosmtp.ErrAuthFailed
+		}
+		return nil
+
 	case sasl.Login:
-		server = newLoginServer(func(username, password string) error {
+		// LOGIN 机制两轮对话
+		loginSrv := newLoginServer(func(username, password string) error {
 			return s.authenticate(username, password)
 		})
+
+		var toClient []byte
+		for {
+			clientBytes, done, err := saslServer.Next(toClient)
+			if err != nil {
+				return gosmtp.ErrAuthFailed
+			}
+			var authErr error
+			toClient, done, authErr = loginSrv.Next(clientBytes)
+			if authErr != nil {
+				s.manager.logger.Warn("SMTP AUTH LOGIN 密码认证失败", zap.Error(authErr))
+				return gosmtp.ErrAuthFailed
+			}
+			if done {
+				return nil
+			}
+		}
+
 	default:
 		return gosmtp.ErrAuthUnsupported
-	}
-
-	var toServer []byte
-	for {
-		fromServer, done, err := saslServer.Next(toServer)
-		if err != nil {
-			return err
-		}
-		if done {
-			return nil
-		}
-		toServer, done, err = server.Next(fromServer)
-		if err != nil {
-			return err
-		}
-		if done {
-			return nil
-		}
 	}
 }
 
@@ -270,10 +353,12 @@ func (s *Session) recordAuthLog(username string, success bool, reason string) {
 
 func (s *Session) Mail(from string, opts *gosmtp.MailOptions) error {
 	s.from = from
+	s.manager.logger.Info("收到 SMTP MAIL FROM", zap.String("from", from), zap.String("remoteIP", s.remoteIP))
 	return nil
 }
 
 func (s *Session) Rcpt(to string, opts *gosmtp.RcptOptions) error {
+	s.manager.logger.Info("收到 SMTP RCPT TO", zap.String("to", to), zap.String("remoteIP", s.remoteIP))
 	recipientDomain := utils.ExtractDomainFromEmail(to)
 	if recipientDomain == "" {
 		return &gosmtp.SMTPError{
@@ -416,7 +501,23 @@ func (s *Session) Data(r io.Reader) error {
 
 	s.manager.logger.Info("成功接收并保存新邮件", zap.String("messageId", msg.MessageID), zap.String("from", msg.FromAddress))
 
-	// 7. 派发 Webhook 事件 mail.received
+	// 7. 如果是通过 SMTP 登录发信，自动压入发送队列进行投递
+	if s.authenticated {
+		for _, rcpt := range s.recipients {
+			queueItem := &model.QueueItem{
+				MessageID:   msg.MessageID,
+				FromAddress: msg.FromAddress,
+				ToAddress:   rcpt,
+				Status:      "pending",
+				RetryCount:  0,
+				MaxRetries:  10,
+				NextRetryAt: time.Now(),
+			}
+			_ = s.manager.repo.CreateQueueItem(queueItem)
+		}
+	}
+
+	// 8. 派发 Webhook 事件 mail.received
 	_ = s.manager.dispatcher.DispatchEvent("mail.received", msg.MessageID, map[string]interface{}{
 		"messageId":      msg.MessageID,
 		"from":           msg.FromAddress,
