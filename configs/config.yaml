@@ -3,7 +3,7 @@ server:
   http_addr: 127.0.0.1:18080
 
 smtp:
-  hostname: mail.chrelyonly.cn
+  hostname: 192.168.10.70
   ports:
     smtp: 25
     smtps: 465
